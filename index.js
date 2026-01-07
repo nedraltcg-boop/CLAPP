@@ -1,47 +1,64 @@
-// index.js
+// index.js - Updated for 2026 compatibility
 
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const tough = require('tough-cookie');
-const axiosCookieJarSupport = require('axios-cookiejar-support').default;
-const qs = require('qs'); // For form-urlencoded
+const { wrapper } = require('axios-cookiejar-support');
+const qs = require('qs');
 const { format, addMonths, subMonths } = require('date-fns');
 
-axiosCookieJarSupport(axios);
+// Enable cookie jar support globally for axios
+wrapper(axios);
 
 const app = express();
 const port = process.env.PORT || 3000;
 
-app.use(cors({ origin: '*' })); // Adjust for your CrewLink app domain in production
+// Allow CORS (restrict origin in production for security)
+app.use(cors({ origin: '*' }));
 app.use(express.json());
 
 app.post('/api/flica-login', async (req, res) => {
   const { userID, password, airlineCode } = req.body;
 
   if (!userID || !password || !airlineCode) {
-    return res.status(400).json({ success: false, error: 'Missing required fields: userID, password, or airlineCode' });
+    return res.status(400).json({
+      success: false,
+      error: 'Missing required fields: userID, password, or airlineCode',
+    });
   }
 
+  // Create a fresh cookie jar for this request
   const jar = new tough.CookieJar();
+
+  // Create axios instance with base URL and cookie support
   const client = axios.create({
-    baseURL: `https://${airlineCode.toLowerCase()}.flica.net`,
+    baseURL: `https://${airlineCode.toUpperCase()}.flica.net`,
     jar,
     withCredentials: true,
+    timeout: 15000, // 15 second timeout
   });
 
   try {
-    // Login POST
-    const loginResponse = await client.post('/wap/Login', qs.stringify({ userID, password }), {
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    });
+    // Step 1: Login
+    const loginResponse = await client.post(
+      '/wap/Login',
+      qs.stringify({ userID, password }),
+      {
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+      }
+    );
 
-    // Assume successful login if status 200 and no error in data; adjust based on actual response
-    if (loginResponse.status !== 200) {
-      return res.status(401).json({ success: false, error: 'Login failed: Invalid credentials or server error' });
+    // FLICA usually returns 200 even on failure — we need to check response content
+    // Adjust this check based on actual behavior (you can test with browser dev tools)
+    const loginData = loginResponse.data;
+    if (typeof loginData === 'string' && loginData.includes('Invalid')) {
+      return res.status(401).json({ success: false, error: 'Login failed: Invalid credentials' });
     }
 
-    // Get current, previous, and next months
+    // Step 2: Fetch schedules for previous, current, and next month
     const now = new Date();
     const months = [
       format(subMonths(now, 1), 'yyyy-MM'),
@@ -54,33 +71,52 @@ app.post('/api/flica-login', async (req, res) => {
     for (const month of months) {
       const scheduleResponse = await client.get(`/wap/LoadMonthlySchedule?month=${month}`);
 
-      // Assume response.data is JSON with 'events' array; adjust parsing as needed
-      // If HTML, you could add cheerio here: const cheerio = require('cheerio'); const $ = cheerio.load(scheduleResponse.data);
-      if (scheduleResponse.data && Array.isArray(scheduleResponse.data.events)) {
-        const parsedEvents = scheduleResponse.data.events.map(event => ({
-          date: event.date || event.DTSTART, // Adjust based on actual keys
-          flightNumber: event.flightNumber || event.SUMMARY,
-          departure: event.departure || event.LOCATION?.split('-')[0],
-          arrival: event.arrival || event.LOCATION?.split('-')[1],
-          time: event.time || `${event.DTSTART} - ${event.DTEND}`,
-          duration: event.duration, // Calculate if needed
-        }));
-        flights.push(...parsedEvents);
-      } else {
-        throw new Error('Unexpected schedule response format');
+      // IMPORTANT: The actual response format varies by airline.
+      // For Mesa (ASH.flica.net), it's often JSON. Inspect the real response!
+      const data = scheduleResponse.data;
+
+      // Example parsing assuming JSON with an 'events' array
+      // Adjust this section based on what you see in browser Network tab
+      if (data && Array.isArray(data.events)) {
+        data.events.forEach((event) => {
+          flights.push({
+            date: event.date || event.DTSTART || '',
+            flightNumber: event.flightNumber || event.SUMMARY?.match(/\d{3,4}[A-Z]?/)?.[0] || '',
+            departure: event.departure || event.LOCATION?.split('-')[0]?.trim() || '',
+            arrival: event.arrival || event.LOCATION?.split('-')[1]?.trim() || '',
+            time: event.time || `${event.DTSTART || ''} - ${event.DTEND || ''}`,
+            duration: event.duration || '',
+            notes: event.DESCRIPTION || event.SUMMARY || '',
+          });
+        });
+      }
+      // If response is HTML, you may need cheerio (add later if needed)
+    }
+
+    return res.json({
+      success: true,
+      flights,
+      error: null,
+    });
+  } catch (error) {
+    console.error('FLICA fetch error:', error.message);
+
+    if (error.response) {
+      if (error.response.status === 401 || error.response.status === 403) {
+        return res.status(401).json({ success: false, error: 'Login failed: Invalid credentials or session' });
       }
     }
 
-    // No storage of credentials; they are discarded after use
-
-    return res.json({ success: true, flights, error: null });
-  } catch (error) {
-    console.error('Error:', error.message); // Log error without credentials
-    if (error.response && error.response.status === 401) {
-      return res.status(401).json({ success: false, error: 'Login failed: Invalid credentials' });
-    }
-    return res.status(500).json({ success: false, error: `Server error: ${error.message}` });
+    return res.status(500).json({
+      success: false,
+      error: 'Failed to reach FLICA or parse schedule. Airline may block automated access.',
+    });
   }
+});
+
+// Health check endpoint (optional)
+app.get('/', (req, res) => {
+  res.send('FLICA backend is running');
 });
 
 app.listen(port, () => {
